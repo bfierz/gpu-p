@@ -401,7 +401,10 @@ Convert-WindowsImage {
         [Parameter(ParameterSetName = "PartitionStyle")]
         [System.Globalization.CultureInfo]
         [ValidateNotNullOrEmpty()]
-        $BcdLocale
+        $BcdLocale,
+
+        [scriptblock]
+        $OnCustomizeImage
     )
 
     #region Code
@@ -2100,9 +2103,9 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
                 #region Additional image enhancements
 
                 If ($RemoteDesktopEnable -or -not $ExpandOnNativeBoot) {
-                    $hivePath = Join-Path -Path $windowsDrive -ChildPath "Windows\System32\Config\System"
+                    $hivePath = Join-Path -Path $windowsDrive -ChildPath "Windows\System32\config\SYSTEM"
 
-                    $hive = Mount-RegistryHive -Hive $hivePath
+                    $hive = Mount-RegistryHive -HivePath $hivePath -HiveKey 'HKLM'
 
                     If ($RemoteDesktopEnable) {
                         Write-Verbose -Message "Enabling Remote Desktop"
@@ -2116,7 +2119,7 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
                         Set-ItemProperty -Path "HKLM:\$($hive)\ControlSet001\Services\FsDepends\Parameters" -Name "VirtualDiskExpandOnMount" -Value 4
                     }
 
-                    Dismount-RegistryHive -HiveMountPoint $hive
+                    Dismount-RegistryHive -HiveMountPoint $hive -HiveKey 'HKLM'
                 }
 
                 If ($Driver) {
@@ -2149,6 +2152,20 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
 
                 #endregion Additional image enhancements
 
+                #region Image customizations
+
+                If ($OnCustomizeImage) {
+
+                    $hklmHivePath = Join-Path -Path $windowsDrive -ChildPath "Windows\System32\config\SOFTWARE"
+                    $hklmHive = Mount-RegistryHive -HivePath $hklmHivePath -HiveKey 'HKLM'
+
+                    Invoke-Command -ScriptBlock $OnCustomizeImage -ArgumentList $windowsDrive, $hklmHive
+
+                    Dismount-RegistryHive -HiveMountPoint $hklmHive -HiveKey 'HKLM'
+                }
+
+                #endregion Image customizations
+
                 #region Dispose paths and dismount VHD
 
                 # Remove system partition access path, if necessary
@@ -2162,16 +2179,16 @@ You can use the fields below to configure the VHD or VHDX that you want to creat
 
                     Write-Verbose -Message "Generating name for $VhdFormat..."
 
-                    $HivePath = Join-Path -Path $windowsDrive -ChildPath "Windows\System32\Config\Software"
+                    $HivePath = Join-Path -Path $windowsDrive -ChildPath "Windows\System32\config\SOFTWARE"
 
-                    $hive = Mount-RegistryHive -Hive $hivePath
+                    $hive = Mount-RegistryHive -HivePath $hivePath -HiveKey 'HKLM'
 
                     $buildLabEx = ( Get-ItemProperty "HKLM:\$($hive)\Microsoft\Windows NT\CurrentVersion" ).BuildLabEx
                     $installType = ( Get-ItemProperty "HKLM:\$($hive)\Microsoft\Windows NT\CurrentVersion" ).InstallationType
                     $editionId = ( Get-ItemProperty "HKLM:\$($hive)\Microsoft\Windows NT\CurrentVersion" ).EditionID
                     $skuFamily = $null
 
-                    Dismount-RegistryHive -HiveMountPoint $hive
+                    Dismount-RegistryHive -HiveMountPoint $hive -HiveKey 'HKLM'
 
                     # Is this ServerCore?
                     # Since we're only doing this string comparison against the InstallType key, we won't get
@@ -4265,15 +4282,20 @@ Mount-RegistryHive {
     param(
         [Parameter(
             Mandatory = $True,
-            ValueFromPipeline = $True,
             Position = 0
         )]
-        [System.IO.FileInfo]
         [ValidateNotNullOrEmpty()]
         [ValidateScript(
-            { $_.Exists }
+            { Test-Path $_ -PathType Leaf }
         )]
-        $Hive
+        [string]$HivePath,
+
+        [Parameter(
+            Mandatory = $False,
+            Position = 1
+        )]
+        [ValidateSet('HKLM', 'HKCU', 'HKCR', 'HKU', 'HKCC')]
+        [string]$HiveKey = 'HKLM'
     )
 
     $mountKey = [System.Guid]::NewGuid().ToString()
@@ -4289,11 +4311,17 @@ public static extern long RegLoadKey(int hKey, String lpSubKey, String lpFile);
         $TokenPrivilege = Set-TokenPrivilege -Privilege "SeBackupPrivilege"
         $TokenPrivilege = Set-TokenPrivilege -Privilege "SeRestorePrivilege"
 
-        $HKLM = 0x80000002
+        switch ($HiveKey) {
+            'HKLM' { $RegRoot = 0x80000002 }
+            'HKCU' { $RegRoot = 0x80000001 }
+            'HKCR' { $RegRoot = 0x80000000 }
+            'HKU' { $RegRoot = 0x80000003 }
+            'HKCC' { $RegRoot = 0x80000005 }
+        }
 
         $Reg = Add-Type -MemberDefinition $Definition -Name "ClassLoad" -Namespace "Win32Functions" -PassThru
 
-        $Result = $Reg::RegLoadKey( $HKLM, $mountKey, $Hive )
+        $Result = $Reg::RegLoadKey( $RegRoot, $mountKey, $HivePath )
 
     }
     Catch {
@@ -4313,13 +4341,29 @@ Dismount-RegistryHive {
     param(
         [Parameter(
             Mandatory = $True,
-            ValueFromPipeline = $True,
             Position = 0
         )]
         [string]
         [ValidateNotNullOrEmpty()]
-        $HiveMountPoint
+        $HiveMountPoint,
+        
+        [Parameter(
+            Mandatory = $False,
+            Position = 1
+        )]
+        [ValidateSet("HKLM", "HKCU", "HKCR", "HKU", "HKCC")]
+        [string]$HiveKey = "HKLM"
     )
+
+    $RegRootValues = @{
+        "HKLM" = 0x80000002
+        "HKCU" = 0x80000001
+        "HKCR" = 0x80000000
+        "HKU"  = 0x80000003
+        "HKCC" = 0x80000005
+    }
+
+    $RootKey = $RegRootValues[$HiveKey]
 
     Try {
         $Definition = @"
@@ -4332,11 +4376,9 @@ public static extern int RegUnLoadKey(Int32 hKey,string lpSubKey);
         $TokenPrivilege = Set-TokenPrivilege -Privilege "SeBackupPrivilege"
         $TokenPrivilege = Set-TokenPrivilege -Privilege "SeRestorePrivilege"
 
-        $HKLM = 0x80000002
-
         $Reg = Add-Type -MemberDefinition $Definition -Name "ClassUnload" -Namespace "Win32Functions" -PassThru
 
-        $Result = $Reg::RegUnLoadKey( $HKLM, $HiveMountPoint )
+        $Result = $Reg::RegUnLoadKey($RootKey, $HiveMountPoint)
 
     }
     Catch {
